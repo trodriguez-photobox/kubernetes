@@ -242,11 +242,8 @@ function kube::build::is_osx() {
 }
 
 function kube::build::update_dockerfile() {
-  if kube::build::is_osx; then
-    sed_opts=("-i ''")
-  else
-    sed_opts=(-i)
-  fi
+  sed_opts=(-i)
+
   sed ${sed_opts[@]} "s/KUBE_BUILD_IMAGE_CROSS_TAG/${KUBE_BUILD_IMAGE_CROSS_TAG}/" "${LOCAL_OUTPUT_BUILD_CONTEXT}/Dockerfile"
   sed ${sed_opts[@]} "s#KUBE_BUILD_HTTP_PROXY#${KUBE_BUILD_HTTP_PROXY:-\"\"}#" "${LOCAL_OUTPUT_BUILD_CONTEXT}/Dockerfile"
   sed ${sed_opts[@]} "s#KUBE_BUILD_HTTPS_PROXY#${KUBE_BUILD_HTTPS_PROXY:-\"\"}#" "${LOCAL_OUTPUT_BUILD_CONTEXT}/Dockerfile"

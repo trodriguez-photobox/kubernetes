@@ -31,6 +31,19 @@
 
 # Use the config file specified in $KUBE_CONFIG_FILE, or default to
 # config-default.sh.
+
+# VPC_ID=Id of the VPC to use, if it exists already will reuse it
+# SUBNET_ID=Id of the subnet to use, if it exists already will reuse it
+# DHCP_OPTION_SET_ID=Id of the DHCP options to use, if it exists already will reuse it. If
+#   undefined, will try to use the dhcp options associated to the VPC, otherwise it will create
+#   a new dhcp options set
+# IGW_ID=Id of the internet gateway associated to the VPC. If the VPC has already one, it will
+#   reuse it, otherwise it will create a new one
+# ROUTE_TABLE_ID=Id of the route table to use. Will try to guess it from the VPC. It will be
+#   the route table associated to the VPC whose tag KubernetesCluster=$CLUSTER_ID. If it doesn't
+#   find one it will create a new one
+# KUBE_MASTER_IP=Public IP (ELB/EIP) associated to the master node, used for cert generation. If
+#   already set, will reuse it.
 KUBE_ROOT=$(dirname "${BASH_SOURCE}")/../..
 source "${KUBE_ROOT}/cluster/aws/${KUBE_CONFIG_FILE-"config-default.sh"}"
 source "${KUBE_ROOT}/cluster/common.sh"
@@ -101,7 +114,7 @@ export AWS_DEFAULT_OUTPUT=text
 AWS_CMD="aws ec2"
 AWS_ASG_CMD="aws autoscaling"
 
-VPC_CIDR_BASE=172.20
+VPC_CIDR_BASE=${VPC_CIDR_BASE:-172.20}
 MASTER_IP_SUFFIX=.9
 VPC_CIDR=${VPC_CIDR_BASE}.0.0/16
 SUBNET_CIDR=${VPC_CIDR_BASE}.0.0/24
@@ -145,6 +158,13 @@ function get_subnet_id {
                      Name=availabilityZone,Values=${az} \
                      Name=vpc-id,Values=${vpc_id} \
            --query Subnets[].SubnetId
+}
+
+function get_dhcp_option_set_id() {
+  local vpc_id=$1
+  $AWS_CMD describe-vpcs \
+           --vpc-ids $vpc_id \
+           --query Vpcs[].DhcpOptionsId
 }
 
 function get_igw_id {
@@ -879,6 +899,20 @@ function vpc-setup {
   echo "Using VPC $VPC_ID"
 }
 
+# Sets up a DHCP option set for the Kubernetes VPC
+# Assumed vars:
+#   VPC_ID
+# Vars set:
+#   DHCP_OPTION_SET_ID
+function dhcp-options-setup {
+  if [[ -z "${DHCP_OPTION_SET_ID:-}" ]]; then
+    DHCP_OPTION_SET_ID=$(get_dhcp_option_set_id $VPC_ID)
+  fi
+  if [[ -z "$DHCP_OPTION_SET_ID" ]]; then
+    create-dhcp-option-set
+  fi
+}
+
 function subnet-setup {
   if [[ -z "${SUBNET_ID:-}" ]]; then
     SUBNET_ID=$(get_subnet_id $VPC_ID $ZONE)
@@ -898,6 +932,52 @@ function subnet-setup {
   fi
 
   echo "Using subnet $SUBNET_ID"
+}
+
+# Sets up the Internet Gateway. It will try to reuse the IGW attached to the VPC
+# Assumed vars:
+#   VPC_ID
+# Vars set:
+#   IGW_ID
+function igw-setup {
+  IGW_ID=$(get_igw_id $VPC_ID)
+  if [[ -z "$IGW_ID" ]]; then
+	  echo "Creating Internet Gateway."
+	  IGW_ID=$($AWS_CMD create-internet-gateway --query InternetGateway.InternetGatewayId)
+	  $AWS_CMD attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID > $LOG
+  fi
+
+  echo "Using Internet Gateway $IGW_ID"
+}
+
+# Sets up the Route table. It will try to find the one tagged with KubernetesCluster=$CLUSTER_ID.
+# If not found, it will create a new one
+# Assumed vars:
+#   VPC_ID
+#   SUBNET_ID
+#   CLUSTER_ID
+# Vars set:
+#   ROUTE_TABLE_ID
+function route-table-setup {
+  echo "Associating route table."
+  ROUTE_TABLE_ID=$($AWS_CMD describe-route-tables \
+                            --filters Name=vpc-id,Values=${VPC_ID} \
+                                      Name=tag:KubernetesCluster,Values=${CLUSTER_ID} \
+                            --query RouteTables[].RouteTableId)
+  if [[ -z "${ROUTE_TABLE_ID}" ]]; then
+    echo "Creating route table"
+    ROUTE_TABLE_ID=$($AWS_CMD create-route-table \
+                              --vpc-id=${VPC_ID} \
+                              --query RouteTable.RouteTableId)
+    add-tag ${ROUTE_TABLE_ID} KubernetesCluster ${CLUSTER_ID}
+  fi
+
+  echo "Associating route table ${ROUTE_TABLE_ID} to subnet ${SUBNET_ID}"
+  $AWS_CMD associate-route-table --route-table-id $ROUTE_TABLE_ID --subnet-id $SUBNET_ID > $LOG || true
+  echo "Adding route to route table ${ROUTE_TABLE_ID}"
+  $AWS_CMD create-route --route-table-id $ROUTE_TABLE_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID > $LOG || true
+
+  echo "Using Route Table $ROUTE_TABLE_ID"
 }
 
 function kube-up {
@@ -927,38 +1007,13 @@ function kube-up {
 
   vpc-setup
 
-  create-dhcp-option-set
+  dhcp-options-setup
 
   subnet-setup
 
-  IGW_ID=$(get_igw_id $VPC_ID)
-  if [[ -z "$IGW_ID" ]]; then
-	  echo "Creating Internet Gateway."
-	  IGW_ID=$($AWS_CMD create-internet-gateway --query InternetGateway.InternetGatewayId)
-	  $AWS_CMD attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID > $LOG
-  fi
+  igw-setup
 
-  echo "Using Internet Gateway $IGW_ID"
-
-  echo "Associating route table."
-  ROUTE_TABLE_ID=$($AWS_CMD describe-route-tables \
-                            --filters Name=vpc-id,Values=${VPC_ID} \
-                                      Name=tag:KubernetesCluster,Values=${CLUSTER_ID} \
-                            --query RouteTables[].RouteTableId)
-  if [[ -z "${ROUTE_TABLE_ID}" ]]; then
-    echo "Creating route table"
-    ROUTE_TABLE_ID=$($AWS_CMD create-route-table \
-                              --vpc-id=${VPC_ID} \
-                              --query RouteTable.RouteTableId)
-    add-tag ${ROUTE_TABLE_ID} KubernetesCluster ${CLUSTER_ID}
-  fi
-
-  echo "Associating route table ${ROUTE_TABLE_ID} to subnet ${SUBNET_ID}"
-  $AWS_CMD associate-route-table --route-table-id $ROUTE_TABLE_ID --subnet-id $SUBNET_ID > $LOG || true
-  echo "Adding route to route table ${ROUTE_TABLE_ID}"
-  $AWS_CMD create-route --route-table-id $ROUTE_TABLE_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID > $LOG || true
-
-  echo "Using Route Table $ROUTE_TABLE_ID"
+  route-table-setup
 
   # Create security groups
   MASTER_SG_ID=$(get_security_group_id "${MASTER_SG_NAME}")
@@ -1051,7 +1106,7 @@ function start-master() {
 
   # We have to make sure that the cert is valid for API_SERVERS
   # i.e. we likely have to pass ELB name / elastic IP in future
-  create-certs "${KUBE_MASTER_IP}" "${MASTER_INTERNAL_IP}"
+  create-certs "${KUBE_MASTER_IP}"
 
   # This key is no longer needed, and this enables us to get under the 16KB size limit
   KUBECFG_CERT_BASE64=""
