@@ -35,7 +35,7 @@
 # VPC_ID=Id of the VPC to use, if it exists already will reuse it
 # SUBNET_ID=Id of the subnet to use, if it exists already will reuse it
 # DHCP_OPTION_SET_ID=Id of the DHCP options to use, if it exists already will reuse it. If
-#   undefined, will try to use the dhcp options associated to the VPC, otherwise it will create
+#   undefined, will try to use the DHCP options associated to the VPC, otherwise it will create
 #   a new dhcp options set
 # IGW_ID=Id of the internet gateway associated to the VPC. If the VPC has already one, it will
 #   reuse it, otherwise it will create a new one
@@ -251,9 +251,14 @@ function detect-master() {
 #   AWS_SSH_KEY
 #   SSH_USER
 function get-master-env() {
-  ssh -oStrictHostKeyChecking=no -i "${AWS_SSH_KEY}" ${SSH_USER}@${KUBE_MASTER_IP} sudo cat /etc/kubernetes/kube_env.yaml
-}
+  if [[ "${ENABLE_MASTER_PUBLIC_IP}" == "true" ]]; then
+    local master_ip=${KUBE_MASTER_IP}
+  else
+    local master_ip=${MASTER_INTERNAL_IP}
+  fi
 
+  ssh -oStrictHostKeyChecking=no -i "${AWS_SSH_KEY}" ${SSH_USER}@${master_ip} sudo cat /etc/kubernetes/kube_env.yaml
+}
 
 function query-running-minions () {
   local query=$1
@@ -1102,11 +1107,14 @@ function start-master() {
   ensure-master-pd
 
   # Get or create master elastic IP
-  ensure-master-ip
-
-  # We have to make sure that the cert is valid for API_SERVERS
-  # i.e. we likely have to pass ELB name / elastic IP in future
-  create-certs "${KUBE_MASTER_IP}"
+  if [[ "${ENABLE_MASTER_PUBLIC_IP}" == "true" ]]; then
+    ensure-master-ip
+    # We have to make sure that the cert is valid for API_SERVERS
+    # i.e. we likely have to pass ELB name / elastic IP in future
+    create-certs "${KUBE_MASTER_IP}"
+  else
+    create-certs "${MASTER_INTERNAL_IP}"
+  fi
 
   # This key is no longer needed, and this enables us to get under the 16KB size limit
   KUBECFG_CERT_BASE64=""
@@ -1145,6 +1153,13 @@ function start-master() {
   # Compress the data to fit under the 16KB limit (cloud-init accepts compressed data)
   gzip "${KUBE_TEMP}/master-user-data"
 
+  local public_ip_option
+  if [[ "${ENABLE_MASTER_PUBLIC_IP}" == "true" ]]; then
+    public_ip_option="--associate-public-ip-address"
+  else
+    public_ip_option="--no-associate-public-ip-address"
+  fi
+
   echo "Starting Master"
   master_id=$($AWS_CMD run-instances \
     --image-id $AWS_IMAGE \
@@ -1154,7 +1169,7 @@ function start-master() {
     --private-ip-address $MASTER_INTERNAL_IP \
     --key-name ${AWS_SSH_KEY_NAME} \
     --security-group-ids ${MASTER_SG_ID} \
-    --associate-public-ip-address \
+    ${public_ip_option} \
     --block-device-mappings "${MASTER_BLOCK_DEVICE_MAPPINGS}" \
     --user-data fileb://${KUBE_TEMP}/master-user-data.gz \
     --query Instances[].InstanceId)
@@ -1183,7 +1198,9 @@ function start-master() {
       KUBE_MASTER=${MASTER_NAME}
       echo -e " ${color_green}[master running]${color_norm}"
 
-      attach-ip-to-instance ${KUBE_MASTER_IP} ${master_id}
+      if [[ "${ENABLE_MASTER_PUBLIC_IP}" == "true" ]]; then
+        attach-ip-to-instance ${KUBE_MASTER_IP} ${master_id}
+      fi
 
       # This is a race between instance start and volume attachment.  There appears to be no way to start an AWS instance with a volume attached.
       # To work around this, we wait for volume to be ready in setup-master-pd.sh
