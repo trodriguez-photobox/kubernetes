@@ -602,6 +602,9 @@ function ensure-master-ip {
     # So be careful changing the IPV4 test, to be sure that 'auto' => 'allocate'
     if [[ "${MASTER_RESERVED_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       KUBE_MASTER_IP="${MASTER_RESERVED_IP}"
+    elif [[ "${ENABLE_MASTER_PUBLIC_IP}" != "true" ]]; then
+      KUBE_MASTER_IP="${MASTER_INTERNAL_IP}"
+      echo "Using master internal ip: ${MASTER_INTERNAL_IP}"
     else
       KUBE_MASTER_IP=`$AWS_CMD allocate-address --domain vpc --query PublicIp`
       echo "Allocated Elastic IP for master: ${KUBE_MASTER_IP}"
@@ -1106,15 +1109,10 @@ function start-master() {
   # Get or create master persistent volume
   ensure-master-pd
 
-  # Get or create master elastic IP
-  if [[ "${ENABLE_MASTER_PUBLIC_IP}" == "true" ]]; then
-    ensure-master-ip
-    # We have to make sure that the cert is valid for API_SERVERS
-    # i.e. we likely have to pass ELB name / elastic IP in future
-    create-certs "${KUBE_MASTER_IP}"
-  else
-    create-certs "${MASTER_INTERNAL_IP}"
-  fi
+  ensure-master-ip
+  # We have to make sure that the cert is valid for API_SERVERS
+  # i.e. we likely have to pass ELB name / elastic IP in future
+  create-certs "${KUBE_MASTER_IP}"
 
   # This key is no longer needed, and this enables us to get under the 16KB size limit
   KUBECFG_CERT_BASE64=""
@@ -1182,7 +1180,12 @@ function start-master() {
 
   while true; do
     echo -n Attempt "$(($attempt+1))" to check for master node
-    local ip=$(get_instance_public_ip ${master_id})
+    local ip
+    if [[ "${ENABLE_MASTER_PUBLIC_IP}" == "true" ]]; then
+      ip=$(get_instance_public_ip ${master_id})
+    else
+      ip=$(get_instance_private_ip ${master_id})
+    fi
     if [[ -z "${ip}" ]]; then
       if (( attempt > 30 )); then
         echo
