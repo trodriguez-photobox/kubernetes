@@ -7,7 +7,7 @@
   {% set api_servers = "--api-servers=https://" + grains.api_servers -%}
 {% elif grains.apiservers is defined -%} # TODO(remove after 0.16.0): Deprecated form
   {% set api_servers = "--api-servers=https://" + grains.apiservers -%}
-{% elif grains['roles'][0] == 'kubernetes-master' -%}
+{% elif grains['roles'][0] == 'kubernetes-master' and salt['grains.get']('fqdn_ip4')[0] is defined -%}
   {% set master_ipv4 = salt['grains.get']('fqdn_ip4')[0] -%}
   {% set api_servers = "--api-servers=https://" + master_ipv4 -%}
 {% else -%}

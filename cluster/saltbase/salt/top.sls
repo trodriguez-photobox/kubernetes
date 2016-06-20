@@ -4,6 +4,7 @@ base:
     - debian-auto-upgrades
     - salt-helpers
 {% if grains.get('cloud') == 'aws' %}
+    - hostname
     - ntp
 {% endif %}
 {% if pillar.get('e2e_storage_test_environment', '').lower() == 'true' %}
